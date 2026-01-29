@@ -1,0 +1,8 @@
+seller-sku	asin1	item-name	fulfillment-channel	price	quantity
+m_black/w_3x4.5_100	B08NV6CLGF	100 Pack Mylar Bags for Food Storage 3x4.5 with Oxygen Absorbers - Black Zipper Bags	AMAZON_NA	12.99
+m_black/w_3.6x5_200	B09ABC1234	200 Pack Mylar Bags for Food Storage 3.6x5 with Oxygen Absorbers - Black Zipper Bags	AMAZON_NA	19.99
+m_black/w_4x6_500	B09DEF5678	500 Pack Mylar Bags for Food Storage 4x6 with Oxygen Absorbers - Black Zipper Bags	AMAZON_NA	34.99
+m_black/w_5x7_1000	B09GHI9012	1000 Pack Mylar Bags for Food Storage 5x7 with Oxygen Absorbers - Black Zipper Bags	AMAZON_NA	59.99
+m_silver/w_6x9_100	B09JKL3456	100 Pack Silver Mylar Bags for Food Storage 6x9 with Oxygen Absorbers - Zipper Bags	AMAZON_NA	14.99
+m_silver/w_8x12_200	B09MNO7890	200 Pack Silver Mylar Bags for Food Storage 8x12 with Oxygen Absorbers - Zipper Bags	AMAZON_NA	29.99
+m_silver/w_10x14_100	B09PQR1234	100 Pack Silver Mylar Bags for Food Storage 10x14 with Oxygen Absorbers - Zipper Bags	AMAZON_NA	24.99
