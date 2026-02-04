@@ -1,2 +1,6 @@
 pandas>=2.0.0
 openpyxl>=3.1.0
+
+# Optional: Supabase integration (persistent storage, history, file uploads)
+# Uncomment the line below to enable Supabase support:
+# supabase>=2.0.0

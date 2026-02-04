@@ -39,7 +39,9 @@ output/
 !samples/*.xlsx
 
 # Sensitive data
+.env
 *.env
+!.env.example
 credentials.json
 active_listings_report.txt
 active_listings_report.csv

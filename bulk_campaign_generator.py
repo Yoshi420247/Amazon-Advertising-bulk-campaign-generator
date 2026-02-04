@@ -13,13 +13,15 @@ Output: Upload-ready .xlsx with only "Sponsored Products Campaigns" sheet.
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+
+from supabase_client import SupabaseStore, get_store
 
 
 # =============================================================================
@@ -852,6 +854,79 @@ def write_bulk_xlsx(rows: list, headers: list, output_path: str) -> None:
 # MAIN WORKFLOW
 # =============================================================================
 
+def _sync_listings_to_supabase(store: SupabaseStore, listings_df: pd.DataFrame) -> None:
+    """
+    Sync parsed listings report data into Supabase for persistence.
+
+    Args:
+        store: Active SupabaseStore instance
+        listings_df: DataFrame from Active Listings Report
+    """
+    # Find column names
+    asin_col = None
+    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
+        if col in listings_df.columns:
+            asin_col = col
+            break
+
+    sku_col = None
+    for col in ['seller-sku', 'Seller SKU', 'sku', 'SKU']:
+        if col in listings_df.columns:
+            sku_col = col
+            break
+
+    if not asin_col or not sku_col:
+        print("      Could not find ASIN/SKU columns for Supabase sync")
+        return
+
+    # Build listing dicts
+    field_map = {
+        'item_name': ['item-name', 'Item Name', 'title', 'Title'],
+        'fulfillment_channel': ['fulfillment-channel', 'Fulfillment Channel'],
+        'price': ['price', 'Price'],
+        'quantity': ['quantity', 'Quantity'],
+    }
+
+    listings_data = []
+    for _, row in listings_df.iterrows():
+        asin = str(row[asin_col]).strip()
+        sku = str(row[sku_col]).strip()
+        if not asin or not sku:
+            continue
+
+        item = {"asin": asin, "seller_sku": sku}
+        for field_key, possible_cols in field_map.items():
+            for col in possible_cols:
+                if col in row.index and str(row[col]).strip():
+                    val = str(row[col]).strip()
+                    if field_key == "price":
+                        try:
+                            item[field_key] = float(val)
+                        except ValueError:
+                            pass
+                    elif field_key == "quantity":
+                        try:
+                            item[field_key] = int(val)
+                        except ValueError:
+                            pass
+                    else:
+                        item[field_key] = val
+                    break
+
+        listings_data.append(item)
+
+    if listings_data:
+        result = store.sync_listings(listings_data)
+        err_count = result['errors']
+        err_msg = f", {err_count} errors" if err_count else ""
+        print(f"      Supabase: synced {result['upserted']} listings{err_msg}")
+
+
+def _count_campaigns(rows: list) -> int:
+    """Count Campaign entity rows."""
+    return sum(1 for r in rows if r.get('Entity') == 'Campaign')
+
+
 def generate_bulk_upload(
     target_asins: list,
     listings_report_path: str,
@@ -859,7 +934,8 @@ def generate_bulk_upload(
     template_path: Optional[str] = None,
     competitor_asins: Optional[list] = None,
     config: Optional[CampaignConfig] = None,
-    tier_assignment: Optional[dict] = None
+    tier_assignment: Optional[dict] = None,
+    store: Optional[SupabaseStore] = None,
 ) -> ValidationResult:
     """
     Main function to generate the bulk upload file.
@@ -872,6 +948,7 @@ def generate_bulk_upload(
         competitor_asins: Optional list of competitor ASINs
         config: Optional CampaignConfig (uses defaults if not provided)
         tier_assignment: Optional dict mapping ASIN to tier ("365+" or "211-330")
+        store: Optional SupabaseStore for persistence
 
     Returns:
         ValidationResult with any errors/warnings
@@ -883,14 +960,24 @@ def generate_bulk_upload(
     print("Amazon Sponsored Products Bulk Campaign Generator")
     print("=" * 60)
 
+    if store:
+        print("  [Supabase] Connected - persistence enabled")
+
     # Step 1: Read Active Listings Report
-    print(f"\n[1/5] Reading Active Listings Report: {listings_report_path}")
+    print(f"\n[1/6] Reading Active Listings Report: {listings_report_path}")
     listings_df = read_active_listings_report(listings_report_path)
     asin_sku_map = build_asin_sku_mapping(listings_df)
     print(f"      Found {len(asin_sku_map)} ASIN→SKU mappings")
 
+    # Step 1b: Sync listings to Supabase if connected
+    if store:
+        print(f"\n[2/6] Syncing listings to Supabase")
+        _sync_listings_to_supabase(store, listings_df)
+    else:
+        print(f"\n[2/6] Supabase not configured, skipping sync")
+
     # Step 2: Validate target ASINs
-    print(f"\n[2/5] Validating {len(target_asins)} target ASINs")
+    print(f"\n[3/6] Validating {len(target_asins)} target ASINs")
     missing_asins = []
     valid_asin_skus = {}
     listing_info_map = {}
@@ -900,13 +987,22 @@ def generate_bulk_upload(
             sku = asin_sku_map[asin]
             valid_asin_skus[asin] = sku
             listing_info_map[sku] = get_listing_info(listings_df, asin)
-            print(f"      ✓ {asin} → {sku}")
+            print(f"      + {asin} -> {sku}")
         else:
+            # Fallback: try Supabase if the ASIN isn't in the local file
+            if store:
+                sku = store.get_sku_for_asin(asin)
+                if sku:
+                    valid_asin_skus[asin] = sku
+                    print(f"      + {asin} -> {sku}  (from Supabase)")
+                    continue
+
             missing_asins.append(asin)
-            print(f"      ✗ {asin} - NOT FOUND")
+            print(f"      x {asin} - NOT FOUND")
 
     if missing_asins:
-        print(f"\nWARNING: {len(missing_asins)} ASINs not found in listings report:")
+        print(f"\nWARNING: {len(missing_asins)} ASINs not found in listings report"
+              f"{' or Supabase' if store else ''}:")
         for asin in missing_asins:
             print(f"  - {asin}")
 
@@ -917,12 +1013,12 @@ def generate_bulk_upload(
         )
 
     # Step 3: Read template headers
-    print(f"\n[3/5] Reading template headers")
+    print(f"\n[4/6] Reading template headers")
     headers = read_template_headers(template_path)
     print(f"      Using {len(headers)} columns")
 
     # Step 4: Generate campaign data
-    print(f"\n[4/5] Generating campaign data")
+    print(f"\n[5/6] Generating campaign data")
     generator = BulkCampaignGenerator(config, headers)
 
     # Group SKUs by tier
@@ -962,7 +1058,7 @@ def generate_bulk_upload(
     print(f"      Generated {len(rows)} total rows")
 
     # Step 5: Validate and write
-    print(f"\n[5/5] Validating and writing output")
+    print(f"\n[6/6] Validating and writing output")
     validation = validate_all_rows(rows)
 
     if not validation.is_valid:
@@ -977,6 +1073,34 @@ def generate_bulk_upload(
             print(f"  WARNING: {warning}")
 
     write_bulk_xlsx(rows, headers, output_path)
+
+    # Step 6: Record run and upload file to Supabase
+    if store:
+        print("\n  [Supabase] Recording generation run...")
+        campaign_count = _count_campaigns(rows)
+
+        run_id = store.record_generation_run(
+            target_asins=target_asins,
+            matched_skus=valid_asin_skus,
+            missing_asins=missing_asins,
+            config=asdict(config),
+            row_count=len(rows),
+            campaign_count=campaign_count,
+            tier_assignment=tier_assignment,
+            competitor_asins=competitor_asins,
+            file_name=Path(output_path).name,
+        )
+        print(f"  [Supabase] Saved as run #{run_id}")
+
+        try:
+            storage_path = store.upload_file(output_path)
+            # Update the run with the storage path
+            store.client.table("generation_runs").update(
+                {"file_storage_path": storage_path}
+            ).eq("id", run_id).execute()
+            print(f"  [Supabase] File uploaded to storage: {storage_path}")
+        except Exception as e:
+            print(f"  [Supabase] File upload skipped: {e}")
 
     print("\n" + "=" * 60)
     print("SUCCESS! Upload file ready.")
@@ -1060,6 +1184,12 @@ def main():
         help="Path to JSON file mapping ASIN to tier (e.g., {\"B08NV6CLGF\": \"365+\"})"
     )
 
+    parser.add_argument(
+        "--no-supabase",
+        action="store_true",
+        help="Disable Supabase integration even if credentials are configured"
+    )
+
     args = parser.parse_args()
 
     # Parse ASINs
@@ -1093,6 +1223,11 @@ def main():
         with open(args.tier_file) as f:
             tier_assignment = json.load(f)
 
+    # Initialize Supabase (optional - silently skipped if not configured)
+    store = None
+    if not args.no_supabase:
+        store = get_store()
+
     # Run generation
     result = generate_bulk_upload(
         target_asins=target_asins,
@@ -1102,6 +1237,7 @@ def main():
         competitor_asins=competitor_asins,
         config=config,
         tier_assignment=tier_assignment,
+        store=store,
     )
 
     if not result.is_valid:

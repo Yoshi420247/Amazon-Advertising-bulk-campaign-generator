@@ -14,10 +14,14 @@ This tool automates the creation of Amazon Sponsored Products campaigns by:
 - Python 3.8+
 - pandas
 - openpyxl
+- supabase (optional, for persistence)
 
 Install dependencies:
 ```bash
 pip install -r requirements.txt
+
+# Optional: enable Supabase integration
+pip install supabase
 ```
 
 ## Quick Start
@@ -72,6 +76,7 @@ python bulk_campaign_generator.py \
 | `--bidding-strategy` | No | Campaign bidding strategy |
 | `--tier-file` | No | JSON file mapping ASIN to tier |
 | `--config` | No | JSON config file for all settings |
+| `--no-supabase` | No | Disable Supabase even if credentials are set |
 
 ## Input Files
 
@@ -158,6 +163,70 @@ The tool validates:
 - **Fix parent rows first**: If a Campaign fails, all child rows show "Not Processed"
 - **Don't reupload processing reports**: They contain extra columns and invalid defaults
 - **Check SKU column**: Ensure SKUs weren't reformatted by Excel
+
+## Supabase Integration (Optional)
+
+When configured, Supabase adds persistent storage and tracking:
+
+- **Listings table** - ASIN/SKU mappings survive between runs. If an ASIN is missing from your local listings report, the generator falls back to the Supabase copy.
+- **Generation history** - Every run is recorded with its config, target ASINs, and results. Prevents accidental duplicate campaigns.
+- **Upload tracking** - Record whether your Amazon Ads upload succeeded or had errors, linked to the generation run.
+- **File storage** - Generated XLSX files are uploaded to a private Supabase Storage bucket for access from anywhere.
+
+### Setup
+
+1. Create a Supabase project at [supabase.com](https://supabase.com)
+
+2. Run the schema migration in the SQL Editor (Dashboard -> SQL Editor -> New Query):
+   ```
+   -- paste contents of supabase_schema.sql
+   ```
+
+3. Install the Python client:
+   ```bash
+   pip install supabase
+   ```
+
+4. Set environment variables (copy `.env.example` to `.env`):
+   ```bash
+   cp .env.example .env
+   # Edit .env with your project URL and API key from:
+   # Dashboard -> Settings -> API
+   ```
+
+   Or export directly:
+   ```bash
+   export SUPABASE_URL=https://your-project-id.supabase.co
+   export SUPABASE_KEY=your-anon-key
+   ```
+
+5. Run the generator normally. It detects Supabase automatically:
+   ```bash
+   python bulk_campaign_generator.py \
+       --asins samples/sample_asins.txt \
+       --listings-report samples/sample_active_listings.txt \
+       --output clearance_campaigns.xlsx
+   ```
+
+   You'll see `[Supabase] Connected - persistence enabled` in the output.
+
+### What gets stored
+
+| Table | Purpose |
+|-------|---------|
+| `listings` | ASIN, SKU, item name, price, fulfillment channel, active/inactive status |
+| `generation_runs` | Timestamp, ASINs, config, row count, file reference |
+| `upload_results` | Linked to a run: status, processed/failed row counts, error details |
+| `campaign-files` bucket | The actual XLSX files |
+
+### Disabling Supabase
+
+If credentials are configured but you want a local-only run:
+```bash
+python bulk_campaign_generator.py --no-supabase ...
+```
+
+Without `SUPABASE_URL` and `SUPABASE_KEY` set, the generator runs fully offline with no warnings.
 
 ## License
 
