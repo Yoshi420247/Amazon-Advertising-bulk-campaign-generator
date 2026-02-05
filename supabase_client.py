@@ -15,7 +15,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 try:
     from supabase import create_client, Client
@@ -63,7 +63,7 @@ class SupabaseStore:
     # Listings
     # =========================================================================
 
-    def sync_listings(self, listings_data: list[dict]) -> dict:
+    def sync_listings(self, listings_data: List[dict]) -> dict:
         """
         Upsert listings from an Active Listings Report parse.
 
@@ -133,7 +133,7 @@ class SupabaseStore:
             return result.data[0]["seller_sku"]
         return None
 
-    def get_all_active_listings(self) -> list[dict]:
+    def get_all_active_listings(self) -> List[dict]:
         """
         Fetch all active listings from Supabase.
 
@@ -149,7 +149,7 @@ class SupabaseStore:
         )
         return result.data or []
 
-    def build_asin_sku_map(self) -> dict[str, str]:
+    def build_asin_sku_map(self) -> Dict[str, str]:
         """
         Build ASIN→SKU mapping from all active listings in Supabase.
 
@@ -165,7 +165,7 @@ class SupabaseStore:
                 mapping[asin] = row["seller_sku"]
         return mapping
 
-    def mark_listings_inactive(self, asins: list[str]) -> int:
+    def mark_listings_inactive(self, asins: List[str]) -> int:
         """
         Mark listings as inactive (e.g., when they disappear from a report).
 
@@ -192,14 +192,14 @@ class SupabaseStore:
 
     def record_generation_run(
         self,
-        target_asins: list[str],
-        matched_skus: dict[str, str],
-        missing_asins: list[str],
+        target_asins: List[str],
+        matched_skus: Dict[str, str],
+        missing_asins: List[str],
         config: dict,
         row_count: int,
         campaign_count: int,
         tier_assignment: Optional[dict] = None,
-        competitor_asins: Optional[list[str]] = None,
+        competitor_asins: Optional[List[str]] = None,
         file_name: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> int:
@@ -240,7 +240,7 @@ class SupabaseStore:
         result = self.client.table("generation_runs").insert(row).execute()
         return result.data[0]["id"]
 
-    def get_generation_history(self, limit: int = 20) -> list[dict]:
+    def get_generation_history(self, limit: int = 20) -> List[dict]:
         """
         Fetch recent generation runs.
 
@@ -340,7 +340,7 @@ class SupabaseStore:
         """
         self.client.table("upload_results").update(kwargs).eq("id", upload_id).execute()
 
-    def get_upload_results(self, generation_run_id: int) -> list[dict]:
+    def get_upload_results(self, generation_run_id: int) -> List[dict]:
         """
         Fetch upload results for a generation run.
 

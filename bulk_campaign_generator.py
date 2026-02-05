@@ -160,6 +160,32 @@ class ValidationResult:
 # ACTIVE LISTINGS REPORT PARSER
 # =============================================================================
 
+def _find_column(df: pd.DataFrame, candidates: list, label: str) -> str:
+    """
+    Find the first matching column name from a list of candidates.
+
+    Args:
+        df: DataFrame to search
+        candidates: List of possible column names
+        label: Human-readable label for error messages
+
+    Returns:
+        The matching column name
+
+    Raises:
+        ValueError: If no matching column is found
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    raise ValueError(f"Could not find {label} column in Active Listings Report. "
+                     f"Expected one of: {candidates}")
+
+
+ASIN_COLUMN_CANDIDATES = ['asin1', 'ASIN1', 'asin', 'ASIN']
+SKU_COLUMN_CANDIDATES = ['seller-sku', 'Seller SKU', 'sku', 'SKU']
+
+
 def read_active_listings_report(filepath: str) -> pd.DataFrame:
     """
     Read Seller Central Active Listings Report.
@@ -203,32 +229,18 @@ def build_asin_sku_mapping(listings_df: pd.DataFrame) -> dict:
     Returns:
         Dict mapping ASIN to seller-sku
     """
-    # Find the ASIN column (may be 'asin1' or 'asin')
-    asin_col = None
-    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
-        if col in listings_df.columns:
-            asin_col = col
-            break
+    asin_col = _find_column(listings_df, ASIN_COLUMN_CANDIDATES, "ASIN")
+    sku_col = _find_column(listings_df, SKU_COLUMN_CANDIDATES, "SKU")
 
-    if asin_col is None:
-        raise ValueError("Could not find ASIN column in Active Listings Report")
-
-    # Find SKU column
-    sku_col = None
-    for col in ['seller-sku', 'Seller SKU', 'sku', 'SKU']:
-        if col in listings_df.columns:
-            sku_col = col
-            break
-
-    if sku_col is None:
-        raise ValueError("Could not find SKU column in Active Listings Report")
-
-    # Build mapping
+    # Build mapping, warn on duplicates
     mapping = {}
     for _, row in listings_df.iterrows():
         asin = str(row[asin_col]).strip()
         sku = str(row[sku_col]).strip()
         if asin and sku:
+            if asin in mapping and mapping[asin] != sku:
+                print(f"Warning: ASIN {asin} maps to multiple SKUs "
+                      f"({mapping[asin]}, {sku}). Using {sku}.")
             mapping[asin] = sku
 
     return mapping
@@ -245,14 +257,9 @@ def get_listing_info(listings_df: pd.DataFrame, asin: str) -> dict:
     Returns:
         Dict with listing info (item-name, fulfillment-channel, price, etc.)
     """
-    # Find the ASIN column
-    asin_col = None
-    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
-        if col in listings_df.columns:
-            asin_col = col
-            break
-
-    if asin_col is None:
+    try:
+        asin_col = _find_column(listings_df, ASIN_COLUMN_CANDIDATES, "ASIN")
+    except ValueError:
         return {}
 
     row = listings_df[listings_df[asin_col] == asin]
@@ -305,13 +312,9 @@ def read_template_headers(template_path: Optional[str] = None) -> list:
         wb = load_workbook(template_path, read_only=True)
 
         # Try to find the correct sheet
-        sheet = None
-        for name in [SHEET_NAME, "Sheet1", wb.sheetnames[0]]:
-            if name in wb.sheetnames:
-                sheet = wb[name]
-                break
-
-        if sheet is None:
+        if SHEET_NAME in wb.sheetnames:
+            sheet = wb[SHEET_NAME]
+        else:
             sheet = wb.active
 
         # Read headers from first row
@@ -348,10 +351,20 @@ def validate_campaign_row(row: dict) -> ValidationResult:
                 'Campaign Targeting Type', 'Campaign Status', 'Campaign Start Date',
                 'Campaign Bidding Strategy']
 
-    for field in required:
-        val = row.get(field, '')
+    for f in required:
+        val = row.get(f, '')
         if val == '' or val is None:
-            errors.append(f"Campaign missing required field: {field}")
+            errors.append(f"Campaign missing required field: {f}")
+
+    # Validate budget is a positive number
+    budget = row.get('Campaign Daily Budget', '')
+    if budget != '' and budget is not None:
+        try:
+            budget_val = float(budget)
+            if budget_val <= 0:
+                errors.append(f"Campaign Daily Budget must be positive, got: {budget}")
+        except (ValueError, TypeError):
+            errors.append(f"Campaign Daily Budget must be a number, got: {budget}")
 
     # Validate enums
     targeting = row.get('Campaign Targeting Type', '')
@@ -375,14 +388,26 @@ def validate_bidding_adjustment_row(row: dict) -> ValidationResult:
 
     required = ['Campaign ID', 'Placement', 'Percentage']
 
-    for field in required:
-        val = row.get(field, '')
+    for f in required:
+        val = row.get(f, '')
         if val == '' or val is None:
-            errors.append(f"Bidding Adjustment missing required field: {field}")
+            errors.append(f"Bidding Adjustment missing required field: {f}")
 
     placement = row.get('Placement', '')
     if placement and placement not in PLACEMENTS:
         errors.append(f"Invalid Placement: {placement}")
+
+    # Validate percentage is non-negative
+    pct = row.get('Percentage', '')
+    if pct != '' and pct is not None:
+        try:
+            pct_val = float(pct)
+            if pct_val < 0:
+                errors.append(f"Percentage must be non-negative, got: {pct}")
+            if pct_val > 900:
+                errors.append(f"Percentage exceeds Amazon maximum of 900%, got: {pct}")
+        except (ValueError, TypeError):
+            errors.append(f"Percentage must be a number, got: {pct}")
 
     return ValidationResult(is_valid=len(errors) == 0, errors=errors)
 
@@ -500,8 +525,9 @@ class BulkCampaignGenerator:
         self.rows = []
 
         # ID counters (negative integers as per Amazon convention)
-        self._campaign_id_counter = -1000
-        self._ad_group_id_counter = -2000
+        # Pre-decremented: first call returns -1000, -2000 respectively
+        self._campaign_id_counter = -999
+        self._ad_group_id_counter = -1999
 
         # Start date
         if config.start_date:
@@ -628,7 +654,8 @@ class BulkCampaignGenerator:
         self._add_row(**row_data)
 
     def add_product_targeting(self, campaign_id: int, ad_group_id: int,
-                              expression: str, bid: Optional[float] = None) -> None:
+                              expression: str, expression_type: str = "manual",
+                              bid: Optional[float] = None) -> None:
         """Add a Product Targeting row."""
         row_data = {
             "Product": "Sponsored Products",
@@ -637,6 +664,7 @@ class BulkCampaignGenerator:
             "Campaign ID": campaign_id,
             "Ad Group ID": ad_group_id,
             "Product Targeting Expression": expression,
+            "Product Targeting Expression Type": expression_type,
             "Product Targeting Status": "enabled",
         }
 
@@ -764,7 +792,7 @@ class BulkCampaignGenerator:
         for target_group in AUTO_TARGETING_GROUPS:
             self.add_product_targeting(
                 auto_campaign_id, auto_ad_group_id,
-                target_group
+                target_group, expression_type="auto"
             )
 
         # =================================================================
@@ -823,6 +851,10 @@ def write_bulk_xlsx(rows: list, headers: list, output_path: str) -> None:
         headers: Column headers
         output_path: Output file path
     """
+    # Ensure output directory exists
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     wb = Workbook()
 
     # Remove default sheet and create our sheet
@@ -862,21 +894,11 @@ def _sync_listings_to_supabase(store: SupabaseStore, listings_df: pd.DataFrame) 
         store: Active SupabaseStore instance
         listings_df: DataFrame from Active Listings Report
     """
-    # Find column names
-    asin_col = None
-    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
-        if col in listings_df.columns:
-            asin_col = col
-            break
-
-    sku_col = None
-    for col in ['seller-sku', 'Seller SKU', 'sku', 'SKU']:
-        if col in listings_df.columns:
-            sku_col = col
-            break
-
-    if not asin_col or not sku_col:
-        print("      Could not find ASIN/SKU columns for Supabase sync")
+    try:
+        asin_col = _find_column(listings_df, ASIN_COLUMN_CANDIDATES, "ASIN")
+        sku_col = _find_column(listings_df, SKU_COLUMN_CANDIDATES, "SKU")
+    except ValueError as e:
+        print(f"      Could not find columns for Supabase sync: {e}")
         return
 
     # Build listing dicts
@@ -978,6 +1000,13 @@ def generate_bulk_upload(
 
     # Step 2: Validate target ASINs
     print(f"\n[3/6] Validating {len(target_asins)} target ASINs")
+
+    # Check ASIN format (10 chars, starts with B0)
+    for asin in target_asins:
+        if len(asin) != 10 or not asin.startswith('B0'):
+            print(f"      Warning: '{asin}' doesn't match expected ASIN format "
+                  f"(10 characters starting with B0)")
+
     missing_asins = []
     valid_asin_skus = {}
     listing_info_map = {}
@@ -1143,7 +1172,7 @@ def main():
 
     parser.add_argument(
         "--competitor-asins",
-        help="Comma-separated list of competitor ASINs for product targeting"
+        help="Comma-separated list of competitor ASINs or path to file (one per line)"
     )
 
     parser.add_argument(
@@ -1199,13 +1228,31 @@ def main():
     else:
         target_asins = [a.strip() for a in args.asins.split(',') if a.strip()]
 
-    # Parse competitor ASINs
+    # Parse competitor ASINs (supports file or comma-separated, like target ASINs)
     competitor_asins = None
     if args.competitor_asins:
-        competitor_asins = [a.strip() for a in args.competitor_asins.split(',') if a.strip()]
+        if Path(args.competitor_asins).exists():
+            with open(args.competitor_asins) as f:
+                competitor_asins = [line.strip() for line in f if line.strip()]
+        else:
+            competitor_asins = [a.strip() for a in args.competitor_asins.split(',') if a.strip()]
 
     # Build config
     if args.config and Path(args.config).exists():
+        # Warn if CLI budget/bid args were also provided (they'll be ignored)
+        cli_overrides = []
+        if args.daily_budget_365 != 50.0:
+            cli_overrides.append("--daily-budget-365")
+        if args.daily_budget_211 != 30.0:
+            cli_overrides.append("--daily-budget-211")
+        if args.default_bid != 0.75:
+            cli_overrides.append("--default-bid")
+        if args.bidding_strategy != "Dynamic bids - down only":
+            cli_overrides.append("--bidding-strategy")
+        if cli_overrides:
+            print(f"Note: --config file takes precedence. "
+                  f"Ignoring CLI args: {', '.join(cli_overrides)}")
+
         with open(args.config) as f:
             config_dict = json.load(f)
         config = CampaignConfig(**config_dict)

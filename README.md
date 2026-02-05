@@ -69,7 +69,7 @@ python bulk_campaign_generator.py \
 | `--listings-report` | Yes | Path to Seller Central Active Listings Report |
 | `--output` | No | Output XLSX file (default: `bulk_upload.xlsx`) |
 | `--template` | No | Amazon Ads bulk template for column headers |
-| `--competitor-asins` | No | Competitor ASINs for product targeting |
+| `--competitor-asins` | No | Competitor ASINs (comma-separated or path to file) |
 | `--daily-budget-365` | No | Budget for 365+ tier (default: 50.0) |
 | `--daily-budget-211` | No | Budget for 211-330 tier (default: 30.0) |
 | `--default-bid` | No | Default ad group bid (default: 0.75) |
