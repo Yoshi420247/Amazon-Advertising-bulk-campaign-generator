@@ -228,6 +228,68 @@ python bulk_campaign_generator.py --no-supabase ...
 
 Without `SUPABASE_URL` and `SUPABASE_KEY` set, the generator runs fully offline with no warnings.
 
+## Web UI (Vercel)
+
+A browser-based interface for generating campaigns without running Python locally.
+
+### Deploy to Vercel
+
+1. Connect your GitHub repo to [Vercel](https://vercel.com)
+2. Import the project - Vercel auto-detects the config from `vercel.json`
+3. (Optional) Add environment variables in Vercel dashboard:
+   - `SUPABASE_URL` - for persistence
+   - `SUPABASE_KEY` - for persistence
+4. Deploy
+
+Once deployed, visit your Vercel URL to use the web form.
+
+### API Endpoint
+
+`POST /api/generate` accepts JSON and returns an XLSX file:
+
+```bash
+curl -X POST https://your-app.vercel.app/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{"asins": ["B08NV6CLGF"], "daily_budget": 50}' \
+  -o campaigns.xlsx
+```
+
+## GitHub Actions
+
+### CI (Automatic)
+
+Tests run automatically on every push and PR to main. See `.github/workflows/ci.yml`.
+
+### Generate Campaigns (Manual)
+
+Generate campaigns directly from GitHub without running anything locally:
+
+1. Go to **Actions** tab in your GitHub repo
+2. Select **"Generate Campaigns"** workflow
+3. Click **"Run workflow"**
+4. Fill in your ASINs, budget, bid, strategy, etc.
+5. Wait for the run to complete
+6. Download the XLSX from the **Artifacts** section
+
+See `.github/workflows/generate.yml`.
+
+#### Supabase with GitHub Actions
+
+To enable Supabase persistence in GitHub Actions:
+
+1. Go to repo **Settings > Secrets and variables > Actions**
+2. Add repository secrets:
+   - `SUPABASE_URL`
+   - `SUPABASE_KEY`
+3. Check "Persist results to Supabase" when running the workflow
+
+## Testing
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
 ## License
 
 MIT

@@ -1,0 +1,132 @@
+name: Generate Campaigns
+
+on:
+  workflow_dispatch:
+    inputs:
+      asins:
+        description: "Target ASINs (comma-separated)"
+        required: true
+        type: string
+      competitor_asins:
+        description: "Competitor ASINs (comma-separated, optional)"
+        required: false
+        type: string
+        default: ""
+      tier:
+        description: "Inventory tier for all ASINs"
+        required: true
+        type: choice
+        options:
+          - "365+"
+          - "211-330"
+          - "mixed (use tier file in repo)"
+        default: "365+"
+      daily_budget:
+        description: "Daily budget ($)"
+        required: false
+        type: string
+        default: "50"
+      default_bid:
+        description: "Default bid ($)"
+        required: false
+        type: string
+        default: "0.75"
+      bidding_strategy:
+        description: "Bidding strategy"
+        required: false
+        type: choice
+        options:
+          - "Dynamic bids - down only"
+          - "Dynamic bids - up and down"
+          - "Fixed bid"
+        default: "Dynamic bids - down only"
+      use_supabase:
+        description: "Persist results to Supabase"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare tier file
+        id: tier
+        run: |
+          if [ "${{ inputs.tier }}" = "mixed (use tier file in repo)" ]; then
+            echo "tier_args=--tier-file samples/sample_tier_assignment.json" >> "$GITHUB_OUTPUT"
+          else
+            # Build a tier file mapping all ASINs to the selected tier
+            python3 -c "
+          import json, sys
+          asins = [a.strip() for a in '${{ inputs.asins }}'.split(',') if a.strip()]
+          tier = '${{ inputs.tier }}'
+          print(json.dumps({a: tier for a in asins}, indent=2))
+          " > /tmp/tier_assignment.json
+            echo "tier_args=--tier-file /tmp/tier_assignment.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate campaigns
+        env:
+          SUPABASE_URL: ${{ inputs.use_supabase && secrets.SUPABASE_URL || '' }}
+          SUPABASE_KEY: ${{ inputs.use_supabase && secrets.SUPABASE_KEY || '' }}
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          OUTPUT_FILE="campaigns_${TIMESTAMP}.xlsx"
+
+          ARGS=(
+            --asins "${{ inputs.asins }}"
+            --listings-report samples/sample_active_listings.txt
+            --output "output/${OUTPUT_FILE}"
+            --daily-budget-365 "${{ inputs.daily_budget }}"
+            --daily-budget-211 "${{ inputs.daily_budget }}"
+            --default-bid "${{ inputs.default_bid }}"
+            --bidding-strategy "${{ inputs.bidding_strategy }}"
+            ${{ steps.tier.outputs.tier_args }}
+          )
+
+          if [ -n "${{ inputs.competitor_asins }}" ]; then
+            ARGS+=(--competitor-asins "${{ inputs.competitor_asins }}")
+          fi
+
+          if [ "${{ inputs.use_supabase }}" != "true" ]; then
+            ARGS+=(--no-supabase)
+          fi
+
+          python bulk_campaign_generator.py "${ARGS[@]}"
+
+          echo "output_file=${OUTPUT_FILE}" >> "$GITHUB_ENV"
+
+      - name: Upload XLSX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.output_file }}
+          path: output/*.xlsx
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## Campaign Generation Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **ASINs:** ${{ inputs.asins }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tier:** ${{ inputs.tier }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Budget:** \$${{ inputs.daily_budget }}/day" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Bid:** \$${{ inputs.default_bid }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Strategy:** ${{ inputs.bidding_strategy }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ inputs.competitor_asins }}" ]; then
+            echo "- **Competitors:** ${{ inputs.competitor_asins }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the XLSX from the **Artifacts** section below." >> "$GITHUB_STEP_SUMMARY"

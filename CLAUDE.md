@@ -19,6 +19,16 @@ supabase_schema.sql           # Database schema for Supabase
 requirements.txt              # Python dependencies
 samples/                      # Example input files
 tests/                        # Test suite (pytest)
+api/                          # Vercel serverless functions
+  generate.py                 # POST /api/generate - returns XLSX
+  health.py                   # GET /api/health - health check
+  requirements.txt            # Python deps for Vercel runtime
+public/                       # Vercel static files
+  index.html                  # Web UI for campaign generation
+vercel.json                   # Vercel deployment config
+.github/workflows/
+  ci.yml                      # Tests on push/PR
+  generate.yml                # Manual campaign generation workflow
 ```
 
 ## Key Commands
@@ -104,3 +114,22 @@ Optional. When `SUPABASE_URL` and `SUPABASE_KEY` env vars are set:
 - Generated XLSX files are stored in a private bucket
 
 Disable with `--no-supabase` even when credentials are configured.
+
+## Deployment
+
+### Vercel (Web UI + API)
+
+The `api/` directory contains Python serverless functions. The `public/` directory has the web UI.
+
+- `POST /api/generate` - Accepts JSON with ASINs, config, returns XLSX
+- `GET /api/health` - Health check
+- `GET /` - Web form UI
+
+Deploy by connecting the GitHub repo to Vercel. Set `SUPABASE_URL` and `SUPABASE_KEY` as environment variables in Vercel dashboard for persistence.
+
+### GitHub Actions
+
+- `ci.yml` - Runs pytest on push/PR to main
+- `generate.yml` - `workflow_dispatch` workflow: fill in ASINs/config in GitHub UI, download XLSX artifact
+
+For Supabase in GitHub Actions, add `SUPABASE_URL` and `SUPABASE_KEY` as repository secrets.

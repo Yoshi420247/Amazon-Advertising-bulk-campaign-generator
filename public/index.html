@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amazon Ads Campaign Generator</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f1117;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem;
+        }
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+            color: #f8fafc;
+        }
+        .subtitle {
+            color: #94a3b8;
+            font-size: 0.875rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: #1e2130;
+            border: 1px solid #2d3348;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .card-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #94a3b8;
+            margin-bottom: 1rem;
+        }
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #cbd5e1;
+            margin-bottom: 0.375rem;
+        }
+        .hint {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 0.5rem;
+        }
+        textarea, input, select {
+            width: 100%;
+            padding: 0.625rem 0.75rem;
+            background: #0f1117;
+            border: 1px solid #2d3348;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 0.875rem;
+            font-family: inherit;
+            margin-bottom: 1rem;
+            transition: border-color 0.15s;
+        }
+        textarea:focus, input:focus, select:focus {
+            outline: none;
+            border-color: #6366f1;
+        }
+        textarea { resize: vertical; min-height: 80px; }
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        .row-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 1rem;
+        }
+        button {
+            width: 100%;
+            padding: 0.75rem;
+            background: #6366f1;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        button:hover { background: #5558e6; }
+        button:disabled {
+            background: #334155;
+            color: #64748b;
+            cursor: not-allowed;
+        }
+        .status {
+            text-align: center;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            display: none;
+        }
+        .status.loading {
+            display: block;
+            background: #1e293b;
+            color: #94a3b8;
+        }
+        .status.success {
+            display: block;
+            background: #0f2a1e;
+            border: 1px solid #166534;
+            color: #4ade80;
+        }
+        .status.error {
+            display: block;
+            background: #2a0f0f;
+            border: 1px solid #991b1b;
+            color: #f87171;
+        }
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #64748b;
+            border-top-color: #e2e8f0;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.5rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Amazon Ads Campaign Generator</h1>
+        <p class="subtitle">Generate Sponsored Products bulk upload XLSX files</p>
+
+        <form id="genForm">
+            <div class="card">
+                <div class="card-title">Target Products</div>
+                <label for="asins">ASINs *</label>
+                <div class="hint">One per line or comma-separated</div>
+                <textarea id="asins" placeholder="B08NV6CLGF&#10;B09ABC1234&#10;B09DEF5678" required></textarea>
+
+                <label for="competitors">Competitor ASINs</label>
+                <div class="hint">Optional - for product targeting campaigns</div>
+                <textarea id="competitors" placeholder="B07ABC1234&#10;B07DEF5678" rows="3"></textarea>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Tier Assignment</div>
+                <div class="row">
+                    <div>
+                        <label for="tierMode">Tier Mode</label>
+                        <select id="tierMode">
+                            <option value="single">Same tier for all ASINs</option>
+                            <option value="custom">Custom per-ASIN tiers</option>
+                        </select>
+                    </div>
+                    <div id="singleTierGroup">
+                        <label for="singleTier">Tier</label>
+                        <select id="singleTier">
+                            <option value="365+">365+ days</option>
+                            <option value="211-330">211-330 days</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="customTierGroup" style="display:none;">
+                    <label for="customTiers">Per-ASIN Tiers</label>
+                    <div class="hint">JSON format: {"B08NV6CLGF": "365+", "B09ABC1234": "211-330"}</div>
+                    <textarea id="customTiers" rows="3" placeholder='{"B08NV6CLGF": "365+", "B09ABC1234": "211-330"}'></textarea>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Campaign Settings</div>
+                <div class="row-3">
+                    <div>
+                        <label for="budget">Daily Budget ($)</label>
+                        <input type="number" id="budget" value="50" min="1" step="0.01">
+                    </div>
+                    <div>
+                        <label for="bid">Default Bid ($)</label>
+                        <input type="number" id="bid" value="0.75" min="0.02" step="0.01">
+                    </div>
+                    <div>
+                        <label for="strategy">Bidding Strategy</label>
+                        <select id="strategy">
+                            <option value="Dynamic bids - down only" selected>Down only</option>
+                            <option value="Dynamic bids - up and down">Up and down</option>
+                            <option value="Fixed bid">Fixed bid</option>
+                        </select>
+                    </div>
+                </div>
+                <label for="prefix">Campaign Name Prefix</label>
+                <input type="text" id="prefix" value="Clearance" placeholder="Clearance">
+            </div>
+
+            <button type="submit" id="submitBtn">Generate & Download XLSX</button>
+        </form>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        const tierMode = document.getElementById('tierMode');
+        const singleTierGroup = document.getElementById('singleTierGroup');
+        const customTierGroup = document.getElementById('customTierGroup');
+
+        tierMode.addEventListener('change', () => {
+            if (tierMode.value === 'custom') {
+                singleTierGroup.style.display = 'none';
+                customTierGroup.style.display = 'block';
+            } else {
+                singleTierGroup.style.display = 'block';
+                customTierGroup.style.display = 'none';
+            }
+        });
+
+        function parseList(text) {
+            return text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+        }
+
+        document.getElementById('genForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const status = document.getElementById('status');
+
+            const asins = parseList(document.getElementById('asins').value);
+            if (asins.length === 0) {
+                status.className = 'status error';
+                status.textContent = 'Please enter at least one ASIN.';
+                return;
+            }
+
+            const competitors = parseList(document.getElementById('competitors').value);
+
+            // Build tier assignment
+            let tierAssignment = null;
+            if (tierMode.value === 'custom') {
+                try {
+                    tierAssignment = JSON.parse(document.getElementById('customTiers').value);
+                } catch {
+                    status.className = 'status error';
+                    status.textContent = 'Invalid JSON in custom tier assignment.';
+                    return;
+                }
+            } else {
+                const tier = document.getElementById('singleTier').value;
+                tierAssignment = {};
+                asins.forEach(a => tierAssignment[a] = tier);
+            }
+
+            const payload = {
+                asins: asins,
+                tier_assignment: tierAssignment,
+                daily_budget: parseFloat(document.getElementById('budget').value),
+                default_bid: parseFloat(document.getElementById('bid').value),
+                bidding_strategy: document.getElementById('strategy').value,
+                campaign_prefix: document.getElementById('prefix').value || 'Clearance',
+            };
+            if (competitors.length > 0) {
+                payload.competitor_asins = competitors;
+            }
+
+            btn.disabled = true;
+            status.className = 'status loading';
+            status.innerHTML = '<span class="spinner"></span>Generating campaigns...';
+
+            try {
+                const resp = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({ error: 'Unknown error' }));
+                    throw new Error(err.error || `HTTP ${resp.status}`);
+                }
+
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `campaigns_${new Date().toISOString().slice(0,10)}.xlsx`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+
+                status.className = 'status success';
+                status.textContent = `Generated ${asins.length} ASINs across ${Object.keys(tierAssignment).length > 0 ? 'tiered' : 'default'} campaigns. Download started.`;
+            } catch (err) {
+                status.className = 'status error';
+                status.textContent = `Error: ${err.message}`;
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
