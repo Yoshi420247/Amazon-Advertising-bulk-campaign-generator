@@ -11,11 +11,14 @@ This module is entirely optional. The generator works without it.
 Enable by setting SUPABASE_URL and SUPABASE_KEY environment variables.
 """
 
+import logging
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from supabase import create_client, Client
@@ -63,6 +66,8 @@ class SupabaseStore:
     # Listings
     # =========================================================================
 
+    UPSERT_BATCH_SIZE = 50
+
     def sync_listings(self, listings_data: list[dict]) -> dict:
         """
         Upsert listings from an Active Listings Report parse.
@@ -71,6 +76,8 @@ class SupabaseStore:
             {"asin": "B08...", "seller_sku": "my-sku-123"}
 
         Optional fields: item_name, fulfillment_channel, price, quantity
+
+        Listings are upserted in batches (default 50) to reduce API calls.
 
         Args:
             listings_data: List of listing dicts
@@ -82,6 +89,8 @@ class SupabaseStore:
         upserted = 0
         errors = 0
 
+        # Build rows for batch upsert
+        rows = []
         for item in listings_data:
             row = {
                 "asin": item["asin"],
@@ -89,21 +98,40 @@ class SupabaseStore:
                 "last_seen_at": now,
                 "status": "active",
             }
+            for fld in ("item_name", "fulfillment_channel", "price",
+                        "quantity"):
+                if fld in item and item[fld]:
+                    row[fld] = item[fld]
+            rows.append(row)
 
-            # Add optional fields if present
-            for field in ("item_name", "fulfillment_channel", "price", "quantity"):
-                if field in item and item[field]:
-                    row[field] = item[field]
-
+        # Upsert in batches
+        for i in range(0, len(rows), self.UPSERT_BATCH_SIZE):
+            batch = rows[i:i + self.UPSERT_BATCH_SIZE]
             try:
                 self.client.table("listings").upsert(
-                    row,
+                    batch,
                     on_conflict="asin,seller_sku"
                 ).execute()
-                upserted += 1
+                upserted += len(batch)
             except Exception as e:
-                print(f"  Warning: Failed to upsert listing {item['asin']}: {e}")
-                errors += 1
+                logger.warning(
+                    "Batch upsert failed for listings %d-%d: %s",
+                    i, i + len(batch), e,
+                )
+                # Fall back to individual upserts for this batch
+                for row in batch:
+                    try:
+                        self.client.table("listings").upsert(
+                            row,
+                            on_conflict="asin,seller_sku"
+                        ).execute()
+                        upserted += 1
+                    except Exception as inner_e:
+                        logger.warning(
+                            "Failed to upsert listing %s: %s",
+                            row["asin"], inner_e,
+                        )
+                        errors += 1
 
         return {"upserted": upserted, "errors": errors}
 
@@ -434,12 +462,12 @@ def get_store() -> Optional[SupabaseStore]:
         return None
 
     if not HAS_SUPABASE:
-        print("Warning: SUPABASE_URL is set but supabase-py is not installed. "
-              "Run: pip install supabase")
+        logger.warning("SUPABASE_URL is set but supabase-py is not installed. "
+                       "Run: pip install supabase")
         return None
 
     try:
         return SupabaseStore(url, key)
     except Exception as e:
-        print(f"Warning: Could not connect to Supabase: {e}")
+        logger.warning("Could not connect to Supabase: %s", e)
         return None

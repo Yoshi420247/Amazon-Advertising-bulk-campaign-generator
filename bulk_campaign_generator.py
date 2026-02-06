@@ -11,7 +11,10 @@ Output: Upload-ready .xlsx with only "Sponsored Products Campaigns" sheet.
 """
 
 import argparse
+import csv
 import json
+import logging
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -20,6 +23,8 @@ from typing import Optional
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+
+logger = logging.getLogger(__name__)
 
 from supabase_client import SupabaseStore, get_store
 
@@ -47,7 +52,7 @@ MATCH_TYPES = {"exact", "phrase", "broad"}
 
 STATES = {"enabled", "paused", "archived"}
 
-AUTO_TARGETING_GROUPS = {"close-match", "loose-match", "substitutes", "complements"}
+AUTO_TARGETING_GROUPS = ("close-match", "loose-match", "substitutes", "complements")
 
 # Sheet name required by Amazon
 SHEET_NAME = "Sponsored Products Campaigns"
@@ -96,6 +101,14 @@ DEFAULT_COLUMNS = [
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
+
+_KNOWN_CONFIG_KEYS = {
+    "daily_budget_365_plus", "daily_budget_211_330", "default_bid",
+    "bidding_strategy", "placement_top_percentage",
+    "placement_product_page_percentage", "start_date", "campaign_prefix",
+    "generic_keywords", "size_tokens", "pack_counts",
+}
+
 
 @dataclass
 class CampaignConfig:
@@ -147,6 +160,77 @@ class CampaignConfig:
         "1000 count",
     ])
 
+    def __post_init__(self):
+        """Validate config values after initialization."""
+        errors = []
+
+        # Validate budgets are positive
+        if self.daily_budget_365_plus <= 0:
+            errors.append(
+                f"daily_budget_365_plus must be positive "
+                f"(got {self.daily_budget_365_plus})")
+        if self.daily_budget_211_330 <= 0:
+            errors.append(
+                f"daily_budget_211_330 must be positive "
+                f"(got {self.daily_budget_211_330})")
+
+        # Validate default bid is positive
+        if self.default_bid <= 0:
+            errors.append(
+                f"default_bid must be positive (got {self.default_bid})")
+
+        # Validate bidding strategy
+        if self.bidding_strategy not in BIDDING_STRATEGIES:
+            errors.append(
+                f"Invalid bidding_strategy: {self.bidding_strategy!r}. "
+                f"Must be one of: {', '.join(sorted(BIDDING_STRATEGIES))}")
+
+        # Validate placement percentages (Amazon allows 0-900)
+        for name, val in [
+            ("placement_top_percentage", self.placement_top_percentage),
+            ("placement_product_page_percentage",
+             self.placement_product_page_percentage),
+        ]:
+            if not isinstance(val, int) or val < 0 or val > 900:
+                errors.append(
+                    f"{name} must be an integer 0-900 (got {val})")
+
+        # Validate start_date format if provided
+        if self.start_date is not None:
+            sd = str(self.start_date)
+            if len(sd) != 8 or not sd.isdigit():
+                errors.append(
+                    f"start_date must be YYYYMMDD format (got {sd!r})")
+            else:
+                try:
+                    datetime.strptime(sd, '%Y%m%d')
+                except ValueError:
+                    errors.append(
+                        f"start_date is not a valid date (got {sd!r})")
+
+        if errors:
+            raise ValueError(
+                "Invalid campaign configuration:\n  - "
+                + "\n  - ".join(errors))
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CampaignConfig":
+        """
+        Create a CampaignConfig from a dict, warning on unknown keys.
+
+        This is preferred over ``CampaignConfig(**data)`` when loading
+        from user-provided JSON, because it catches typos in key names.
+        """
+        unknown = set(data.keys()) - _KNOWN_CONFIG_KEYS
+        if unknown:
+            logger.warning(
+                "Unknown keys in config (possibly typos): %s",
+                ", ".join(sorted(unknown)),
+            )
+        # Only pass known keys to avoid TypeError on unknown kwargs
+        filtered = {k: v for k, v in data.items() if k in _KNOWN_CONFIG_KEYS}
+        return cls(**filtered)
+
 
 @dataclass
 class ValidationResult:
@@ -160,42 +244,139 @@ class ValidationResult:
 # ACTIVE LISTINGS REPORT PARSER
 # =============================================================================
 
-def read_active_listings_report(filepath: str) -> pd.DataFrame:
+REQUIRED_LISTING_COLUMNS = {
+    "asin": ['asin1', 'ASIN1', 'asin', 'ASIN'],
+    "sku": ['seller-sku', 'Seller SKU', 'sku', 'SKU'],
+}
+
+
+def read_active_listings_report(
+    filepath: str,
+    delimiter: Optional[str] = None,
+) -> pd.DataFrame:
     """
     Read Seller Central Active Listings Report.
 
-    Attempts tab-delimited first, then falls back to CSV.
+    Delimiter resolution order:
+    1. Explicit ``delimiter`` argument (e.g. from ``--delimiter`` CLI flag).
+    2. Auto-detect via ``csv.Sniffer`` on the first 8 KB.
+    3. Fallback chain: tab-delimited, then comma-delimited CSV.
+
+    After parsing, the function validates that columns needed for ASIN and
+    SKU mapping are present in the resulting DataFrame.
 
     Args:
         filepath: Path to the Active Listings Report file
+        delimiter: Optional explicit delimiter character
 
     Returns:
         DataFrame with listing data
+
+    Raises:
+        FileNotFoundError: If the file does not exist
+        ValueError: If the file cannot be parsed or required columns are missing
     """
     path = Path(filepath)
 
     if not path.exists():
         raise FileNotFoundError(f"Active Listings Report not found: {filepath}")
 
-    # Try tab-delimited first
-    try:
-        df = pd.read_csv(filepath, sep='\t', dtype=str, keep_default_na=False)
-        if len(df.columns) > 1:
-            return df
-    except Exception:
-        pass
+    df = None
+    parse_errors = []
 
-    # Fall back to CSV
-    try:
-        df = pd.read_csv(filepath, dtype=str, keep_default_na=False)
-        return df
-    except Exception as e:
-        raise ValueError(f"Could not parse Active Listings Report: {e}")
+    # 1. Explicit delimiter
+    if delimiter is not None:
+        try:
+            df = pd.read_csv(filepath, sep=delimiter, dtype=str,
+                             keep_default_na=False)
+        except Exception as e:
+            raise ValueError(
+                f"Could not parse Active Listings Report with "
+                f"delimiter {delimiter!r}: {e}"
+            )
+    else:
+        # 2. Auto-detect via csv.Sniffer
+        try:
+            with open(filepath, 'r', newline='') as f:
+                sample = f.read(8192)
+            detected = csv.Sniffer().sniff(sample)
+            df = pd.read_csv(filepath, sep=detected.delimiter, dtype=str,
+                             keep_default_na=False)
+            if len(df.columns) <= 1:
+                df = None
+                parse_errors.append(
+                    f"Sniffer detected delimiter {detected.delimiter!r} "
+                    f"but resulted in only 1 column"
+                )
+        except Exception as e:
+            parse_errors.append(f"csv.Sniffer failed: {e}")
+
+        # 3. Fallback: tab then comma
+        if df is None:
+            try:
+                df = pd.read_csv(filepath, sep='\t', dtype=str,
+                                 keep_default_na=False)
+                if len(df.columns) <= 1:
+                    parse_errors.append(
+                        "Tab-delimited parse yielded only 1 column")
+                    df = None
+            except Exception as e:
+                parse_errors.append(f"Tab-delimited parse failed: {e}")
+
+        if df is None:
+            try:
+                df = pd.read_csv(filepath, dtype=str,
+                                 keep_default_na=False)
+            except Exception as e:
+                parse_errors.append(f"CSV parse failed: {e}")
+
+    if df is None:
+        raise ValueError(
+            f"Could not parse Active Listings Report '{filepath}'. "
+            f"Attempts: {'; '.join(parse_errors)}"
+        )
+
+    if parse_errors:
+        logger.debug("Listing report parse notes: %s", "; ".join(parse_errors))
+
+    # Validate that required columns are present
+    missing_cols = []
+    for role, candidates in REQUIRED_LISTING_COLUMNS.items():
+        if not any(c in df.columns for c in candidates):
+            missing_cols.append(
+                f"{role} (expected one of: {', '.join(candidates)})"
+            )
+
+    if missing_cols:
+        raise ValueError(
+            f"Active Listings Report is missing required columns: "
+            f"{'; '.join(missing_cols)}. "
+            f"Detected columns: {list(df.columns)}"
+        )
+
+    logger.info("Parsed Active Listings Report: %d rows, %d columns "
+                "(delimiter=%r)", len(df), len(df.columns),
+                delimiter or 'auto')
+
+    return df
+
+
+def _find_column(df: pd.DataFrame, candidates: list, role: str) -> str:
+    """Find the first matching column name from a list of candidates."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    raise ValueError(
+        f"Could not find {role} column in Active Listings Report. "
+        f"Expected one of: {candidates}"
+    )
 
 
 def build_asin_sku_mapping(listings_df: pd.DataFrame) -> dict:
     """
-    Build ASIN → SKU mapping from Active Listings Report.
+    Build ASIN -> SKU mapping from Active Listings Report.
+
+    Uses vectorized pandas operations for better performance on large files.
 
     Args:
         listings_df: DataFrame from Active Listings Report
@@ -203,40 +384,71 @@ def build_asin_sku_mapping(listings_df: pd.DataFrame) -> dict:
     Returns:
         Dict mapping ASIN to seller-sku
     """
-    # Find the ASIN column (may be 'asin1' or 'asin')
-    asin_col = None
-    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
-        if col in listings_df.columns:
-            asin_col = col
-            break
+    asin_col = _find_column(listings_df,
+                            ['asin1', 'ASIN1', 'asin', 'ASIN'], 'ASIN')
+    sku_col = _find_column(listings_df,
+                           ['seller-sku', 'Seller SKU', 'sku', 'SKU'], 'SKU')
 
-    if asin_col is None:
-        raise ValueError("Could not find ASIN column in Active Listings Report")
+    # Vectorized: strip whitespace and drop empty rows
+    asins = listings_df[asin_col].astype(str).str.strip()
+    skus = listings_df[sku_col].astype(str).str.strip()
+    mask = (asins != '') & (skus != '')
 
-    # Find SKU column
-    sku_col = None
-    for col in ['seller-sku', 'Seller SKU', 'sku', 'SKU']:
-        if col in listings_df.columns:
-            sku_col = col
-            break
+    return dict(zip(asins[mask], skus[mask]))
 
-    if sku_col is None:
-        raise ValueError("Could not find SKU column in Active Listings Report")
 
-    # Build mapping
-    mapping = {}
+def build_listing_info_map(listings_df: pd.DataFrame) -> dict:
+    """
+    Build a lookup dict mapping ASIN -> listing info for all rows.
+
+    Pre-builds the entire map once so per-ASIN lookups avoid repeated
+    DataFrame filtering.
+
+    Returns:
+        Dict mapping ASIN to info dict with keys like 'item-name', 'price', etc.
+    """
+    try:
+        asin_col = _find_column(listings_df,
+                                ['asin1', 'ASIN1', 'asin', 'ASIN'], 'ASIN')
+    except ValueError:
+        return {}
+
+    field_mapping = {
+        'item-name': ['item-name', 'Item Name', 'title', 'Title'],
+        'fulfillment-channel': ['fulfillment-channel', 'Fulfillment Channel'],
+        'price': ['price', 'Price'],
+        'quantity': ['quantity', 'Quantity'],
+    }
+
+    # Resolve which actual columns exist
+    resolved_fields = {}
+    for key, candidates in field_mapping.items():
+        for col in candidates:
+            if col in listings_df.columns:
+                resolved_fields[key] = col
+                break
+
+    info_map = {}
     for _, row in listings_df.iterrows():
         asin = str(row[asin_col]).strip()
-        sku = str(row[sku_col]).strip()
-        if asin and sku:
-            mapping[asin] = sku
+        if not asin or asin in info_map:
+            continue
+        info = {}
+        for key, col in resolved_fields.items():
+            val = str(row[col]).strip()
+            if val:
+                info[key] = val
+        info_map[asin] = info
 
-    return mapping
+    return info_map
 
 
 def get_listing_info(listings_df: pd.DataFrame, asin: str) -> dict:
     """
     Get additional listing info for an ASIN.
+
+    For bulk lookups, prefer ``build_listing_info_map()`` which avoids
+    per-ASIN DataFrame filtering.
 
     Args:
         listings_df: DataFrame from Active Listings Report
@@ -245,14 +457,10 @@ def get_listing_info(listings_df: pd.DataFrame, asin: str) -> dict:
     Returns:
         Dict with listing info (item-name, fulfillment-channel, price, etc.)
     """
-    # Find the ASIN column
-    asin_col = None
-    for col in ['asin1', 'ASIN1', 'asin', 'ASIN']:
-        if col in listings_df.columns:
-            asin_col = col
-            break
-
-    if asin_col is None:
+    try:
+        asin_col = _find_column(listings_df,
+                                ['asin1', 'ASIN1', 'asin', 'ASIN'], 'ASIN')
+    except ValueError:
         return {}
 
     row = listings_df[listings_df[asin_col] == asin]
@@ -262,7 +470,6 @@ def get_listing_info(listings_df: pd.DataFrame, asin: str) -> dict:
     row = row.iloc[0]
     info = {}
 
-    # Extract common fields
     field_mapping = {
         'item-name': ['item-name', 'Item Name', 'title', 'Title'],
         'fulfillment-channel': ['fulfillment-channel', 'Fulfillment Channel'],
@@ -298,7 +505,8 @@ def read_template_headers(template_path: Optional[str] = None) -> list:
 
     path = Path(template_path)
     if not path.exists():
-        print(f"Warning: Template not found at {template_path}, using default columns")
+        logger.warning("Template not found at %s, using default columns",
+                       template_path)
         return DEFAULT_COLUMNS.copy()
 
     try:
@@ -327,17 +535,44 @@ def read_template_headers(template_path: Optional[str] = None) -> list:
         if headers:
             return headers
         else:
-            print("Warning: No headers found in template, using default columns")
+            logger.warning("No headers found in template, using default columns")
             return DEFAULT_COLUMNS.copy()
 
     except Exception as e:
-        print(f"Warning: Could not read template ({e}), using default columns")
+        logger.warning("Could not read template (%s), using default columns", e)
         return DEFAULT_COLUMNS.copy()
 
 
 # =============================================================================
 # VALIDATION
 # =============================================================================
+
+def _validate_positive_float(value, field_name: str) -> list:
+    """Validate that a value is a positive number. Returns list of errors."""
+    if value == '' or value is None:
+        return []
+    try:
+        num = float(value)
+        if num < 0:
+            return [f"{field_name} must not be negative (got {num})"]
+        return []
+    except (ValueError, TypeError):
+        return [f"{field_name} must be a number (got {value!r})"]
+
+
+def _validate_date_format(value, field_name: str) -> list:
+    """Validate YYYYMMDD date format. Returns list of errors."""
+    if value == '' or value is None:
+        return []
+    val_str = str(value)
+    if len(val_str) != 8 or not val_str.isdigit():
+        return [f"{field_name} must be in YYYYMMDD format (got {val_str!r})"]
+    try:
+        datetime.strptime(val_str, '%Y%m%d')
+    except ValueError:
+        return [f"{field_name} is not a valid date (got {val_str!r})"]
+    return []
+
 
 def validate_campaign_row(row: dict) -> ValidationResult:
     """Validate a Campaign entity row."""
@@ -348,10 +583,10 @@ def validate_campaign_row(row: dict) -> ValidationResult:
                 'Campaign Targeting Type', 'Campaign Status', 'Campaign Start Date',
                 'Campaign Bidding Strategy']
 
-    for field in required:
-        val = row.get(field, '')
+    for fld in required:
+        val = row.get(fld, '')
         if val == '' or val is None:
-            errors.append(f"Campaign missing required field: {field}")
+            errors.append(f"Campaign missing required field: {fld}")
 
     # Validate enums
     targeting = row.get('Campaign Targeting Type', '')
@@ -366,40 +601,71 @@ def validate_campaign_row(row: dict) -> ValidationResult:
     if status and status not in STATES:
         errors.append(f"Invalid Campaign Status: {status}")
 
+    # Validate numeric range: daily budget must be positive
+    errors.extend(_validate_positive_float(
+        row.get('Campaign Daily Budget', ''), 'Campaign Daily Budget'))
+
+    # Validate date format
+    errors.extend(_validate_date_format(
+        row.get('Campaign Start Date', ''), 'Campaign Start Date'))
+    errors.extend(_validate_date_format(
+        row.get('Campaign End Date', ''), 'Campaign End Date'))
+
     return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 def validate_bidding_adjustment_row(row: dict) -> ValidationResult:
     """Validate a Bidding Adjustment entity row."""
     errors = []
+    warnings = []
 
     required = ['Campaign ID', 'Placement', 'Percentage']
 
-    for field in required:
-        val = row.get(field, '')
+    for fld in required:
+        val = row.get(fld, '')
         if val == '' or val is None:
-            errors.append(f"Bidding Adjustment missing required field: {field}")
+            errors.append(f"Bidding Adjustment missing required field: {fld}")
 
     placement = row.get('Placement', '')
     if placement and placement not in PLACEMENTS:
         errors.append(f"Invalid Placement: {placement}")
 
-    return ValidationResult(is_valid=len(errors) == 0, errors=errors)
+    # Validate percentage range (Amazon allows 0-900%)
+    pct = row.get('Percentage', '')
+    if pct != '' and pct is not None:
+        try:
+            pct_val = int(pct)
+            if pct_val < 0 or pct_val > 900:
+                errors.append(
+                    f"Placement Percentage must be 0-900 (got {pct_val})")
+        except (ValueError, TypeError):
+            errors.append(f"Placement Percentage must be an integer (got {pct!r})")
+
+    return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 def validate_ad_group_row(row: dict) -> ValidationResult:
     """Validate an Ad Group entity row."""
     errors = []
+    warnings = []
 
     required = ['Campaign ID', 'Ad Group ID', 'Ad Group Name',
                 'Ad Group Default Bid', 'Ad Group Status']
 
-    for field in required:
-        val = row.get(field, '')
+    for fld in required:
+        val = row.get(fld, '')
         if val == '' or val is None:
-            errors.append(f"Ad Group missing required field: {field}")
+            errors.append(f"Ad Group missing required field: {fld}")
 
-    return ValidationResult(is_valid=len(errors) == 0, errors=errors)
+    # Validate default bid is a positive number
+    errors.extend(_validate_positive_float(
+        row.get('Ad Group Default Bid', ''), 'Ad Group Default Bid'))
+
+    status = row.get('Ad Group Status', '')
+    if status and status not in STATES:
+        errors.append(f"Invalid Ad Group Status: {status}")
+
+    return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 def validate_product_ad_row(row: dict) -> ValidationResult:
@@ -419,34 +685,43 @@ def validate_product_ad_row(row: dict) -> ValidationResult:
 def validate_keyword_row(row: dict) -> ValidationResult:
     """Validate a Keyword entity row."""
     errors = []
+    warnings = []
 
     required = ['Campaign ID', 'Ad Group ID', 'Keyword Text', 'Match Type', 'Keyword Status']
 
-    for field in required:
-        val = row.get(field, '')
+    for fld in required:
+        val = row.get(fld, '')
         if val == '' or val is None:
-            errors.append(f"Keyword missing required field: {field}")
+            errors.append(f"Keyword missing required field: {fld}")
 
     match_type = row.get('Match Type', '')
     if match_type and match_type not in MATCH_TYPES:
         errors.append(f"Invalid Match Type: {match_type}")
 
-    return ValidationResult(is_valid=len(errors) == 0, errors=errors)
+    # Validate bid is positive if present
+    errors.extend(_validate_positive_float(row.get('Bid', ''), 'Keyword Bid'))
+
+    return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 def validate_product_targeting_row(row: dict) -> ValidationResult:
     """Validate a Product Targeting entity row."""
     errors = []
+    warnings = []
 
     required = ['Campaign ID', 'Ad Group ID', 'Product Targeting Expression',
                 'Product Targeting Status']
 
-    for field in required:
-        val = row.get(field, '')
+    for fld in required:
+        val = row.get(fld, '')
         if val == '' or val is None:
-            errors.append(f"Product Targeting missing required field: {field}")
+            errors.append(f"Product Targeting missing required field: {fld}")
 
-    return ValidationResult(is_valid=len(errors) == 0, errors=errors)
+    # Validate bid is positive if present
+    errors.extend(_validate_positive_float(
+        row.get('Product Targeting Bid', ''), 'Product Targeting Bid'))
+
+    return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 def validate_all_rows(rows: list) -> ValidationResult:
@@ -645,6 +920,32 @@ class BulkCampaignGenerator:
 
         self._add_row(**row_data)
 
+    def add_campaign_with_placements(self, name: str, daily_budget: float,
+                                     targeting_type: str) -> int:
+        """
+        Add a Campaign row together with its standard placement adjustments.
+
+        This is a convenience wrapper that creates the campaign and appends
+        the two default bidding-adjustment rows (Top-of-Search and Product
+        Page) so the pattern is not repeated for every campaign type.
+
+        Returns:
+            Campaign ID (negative integer)
+        """
+        campaign_id = self.add_campaign(
+            name=name, daily_budget=daily_budget,
+            targeting_type=targeting_type,
+        )
+        self.add_bidding_adjustment(
+            campaign_id, "placementTop",
+            self.config.placement_top_percentage,
+        )
+        self.add_bidding_adjustment(
+            campaign_id, "placementProductPage",
+            self.config.placement_product_page_percentage,
+        )
+        return campaign_id
+
     def generate_clearance_campaigns(self, tier: str, skus: list,
                                      competitor_asins: Optional[list] = None,
                                      listing_info: Optional[dict] = None) -> None:
@@ -671,20 +972,10 @@ class BulkCampaignGenerator:
         # =================================================================
         # CAMPAIGN 1: Manual Keywords
         # =================================================================
-        manual_kw_campaign_id = self.add_campaign(
+        manual_kw_campaign_id = self.add_campaign_with_placements(
             name=f"{prefix} - {tier} - Manual Keywords",
             daily_budget=budget,
-            targeting_type="MANUAL"
-        )
-
-        # Add placement adjustments
-        self.add_bidding_adjustment(
-            manual_kw_campaign_id, "placementTop",
-            self.config.placement_top_percentage
-        )
-        self.add_bidding_adjustment(
-            manual_kw_campaign_id, "placementProductPage",
-            self.config.placement_product_page_percentage
+            targeting_type="MANUAL",
         )
 
         # Create ad groups and keywords for each SKU
@@ -733,20 +1024,10 @@ class BulkCampaignGenerator:
         # =================================================================
         # CAMPAIGN 2: Auto
         # =================================================================
-        auto_campaign_id = self.add_campaign(
+        auto_campaign_id = self.add_campaign_with_placements(
             name=f"{prefix} - {tier} - Auto",
             daily_budget=budget,
-            targeting_type="AUTO"
-        )
-
-        # Add placement adjustments
-        self.add_bidding_adjustment(
-            auto_campaign_id, "placementTop",
-            self.config.placement_top_percentage
-        )
-        self.add_bidding_adjustment(
-            auto_campaign_id, "placementProductPage",
-            self.config.placement_product_page_percentage
+            targeting_type="AUTO",
         )
 
         # Single ad group for auto campaign with all SKUs
@@ -770,20 +1051,10 @@ class BulkCampaignGenerator:
         # =================================================================
         # CAMPAIGN 3: Manual Product Targeting
         # =================================================================
-        manual_pt_campaign_id = self.add_campaign(
+        manual_pt_campaign_id = self.add_campaign_with_placements(
             name=f"{prefix} - {tier} - Product Targeting",
             daily_budget=budget,
-            targeting_type="MANUAL"
-        )
-
-        # Add placement adjustments
-        self.add_bidding_adjustment(
-            manual_pt_campaign_id, "placementTop",
-            self.config.placement_top_percentage
-        )
-        self.add_bidding_adjustment(
-            manual_pt_campaign_id, "placementProductPage",
-            self.config.placement_product_page_percentage
+            targeting_type="MANUAL",
         )
 
         # Create ad group for product targeting
@@ -804,6 +1075,11 @@ class BulkCampaignGenerator:
                     manual_pt_campaign_id, pt_ad_group_id,
                     f'asin="{comp_asin}"'
                 )
+        else:
+            logger.warning(
+                "No competitor ASINs provided for %s Product Targeting "
+                "campaign - only SKU ads will be created (no targets)", tier
+            )
 
     def get_rows(self) -> list:
         """Get all generated rows."""
@@ -846,8 +1122,11 @@ def write_bulk_xlsx(rows: list, headers: list, output_path: str) -> None:
                 ws.cell(row=row_idx, column=col_idx, value=value)
 
     # Save
+    # Ensure output directory exists
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
     wb.save(output_path)
-    print(f"Wrote {len(rows)} rows to {output_path}")
+    logger.info("Wrote %d rows to %s", len(rows), output_path)
 
 
 # =============================================================================
@@ -876,7 +1155,7 @@ def _sync_listings_to_supabase(store: SupabaseStore, listings_df: pd.DataFrame) 
             break
 
     if not asin_col or not sku_col:
-        print("      Could not find ASIN/SKU columns for Supabase sync")
+        logger.warning("Could not find ASIN/SKU columns for Supabase sync")
         return
 
     # Build listing dicts
@@ -919,7 +1198,8 @@ def _sync_listings_to_supabase(store: SupabaseStore, listings_df: pd.DataFrame) 
         result = store.sync_listings(listings_data)
         err_count = result['errors']
         err_msg = f", {err_count} errors" if err_count else ""
-        print(f"      Supabase: synced {result['upserted']} listings{err_msg}")
+        logger.info("Supabase: synced %d listings%s",
+                     result['upserted'], err_msg)
 
 
 def _count_campaigns(rows: list) -> int:
@@ -936,6 +1216,7 @@ def generate_bulk_upload(
     config: Optional[CampaignConfig] = None,
     tier_assignment: Optional[dict] = None,
     store: Optional[SupabaseStore] = None,
+    delimiter: Optional[str] = None,
 ) -> ValidationResult:
     """
     Main function to generate the bulk upload file.
@@ -949,6 +1230,7 @@ def generate_bulk_upload(
         config: Optional CampaignConfig (uses defaults if not provided)
         tier_assignment: Optional dict mapping ASIN to tier ("365+" or "211-330")
         store: Optional SupabaseStore for persistence
+        delimiter: Optional explicit delimiter for listings report
 
     Returns:
         ValidationResult with any errors/warnings
@@ -956,28 +1238,31 @@ def generate_bulk_upload(
     if config is None:
         config = CampaignConfig()
 
-    print("=" * 60)
-    print("Amazon Sponsored Products Bulk Campaign Generator")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Amazon Sponsored Products Bulk Campaign Generator")
+    logger.info("=" * 60)
 
     if store:
-        print("  [Supabase] Connected - persistence enabled")
+        logger.info("[Supabase] Connected - persistence enabled")
 
     # Step 1: Read Active Listings Report
-    print(f"\n[1/6] Reading Active Listings Report: {listings_report_path}")
-    listings_df = read_active_listings_report(listings_report_path)
+    logger.info("[1/6] Reading Active Listings Report: %s",
+                listings_report_path)
+    listings_df = read_active_listings_report(listings_report_path,
+                                              delimiter=delimiter)
     asin_sku_map = build_asin_sku_mapping(listings_df)
-    print(f"      Found {len(asin_sku_map)} ASIN→SKU mappings")
+    all_listing_info = build_listing_info_map(listings_df)
+    logger.info("Found %d ASIN->SKU mappings", len(asin_sku_map))
 
     # Step 1b: Sync listings to Supabase if connected
     if store:
-        print(f"\n[2/6] Syncing listings to Supabase")
+        logger.info("[2/6] Syncing listings to Supabase")
         _sync_listings_to_supabase(store, listings_df)
     else:
-        print(f"\n[2/6] Supabase not configured, skipping sync")
+        logger.info("[2/6] Supabase not configured, skipping sync")
 
     # Step 2: Validate target ASINs
-    print(f"\n[3/6] Validating {len(target_asins)} target ASINs")
+    logger.info("[3/6] Validating %d target ASINs", len(target_asins))
     missing_asins = []
     valid_asin_skus = {}
     listing_info_map = {}
@@ -986,25 +1271,32 @@ def generate_bulk_upload(
         if asin in asin_sku_map:
             sku = asin_sku_map[asin]
             valid_asin_skus[asin] = sku
-            listing_info_map[sku] = get_listing_info(listings_df, asin)
-            print(f"      + {asin} -> {sku}")
+            listing_info_map[sku] = all_listing_info.get(asin, {})
+            logger.info("  + %s -> %s", asin, sku)
         else:
             # Fallback: try Supabase if the ASIN isn't in the local file
             if store:
                 sku = store.get_sku_for_asin(asin)
                 if sku:
                     valid_asin_skus[asin] = sku
-                    print(f"      + {asin} -> {sku}  (from Supabase)")
+                    logger.info("  + %s -> %s  (from Supabase)", asin, sku)
                     continue
 
             missing_asins.append(asin)
-            print(f"      x {asin} - NOT FOUND")
+            logger.warning("  x %s - NOT FOUND", asin)
 
     if missing_asins:
-        print(f"\nWARNING: {len(missing_asins)} ASINs not found in listings report"
-              f"{' or Supabase' if store else ''}:")
-        for asin in missing_asins:
-            print(f"  - {asin}")
+        sample = missing_asins[:5]
+        sample_str = ", ".join(sample)
+        extra = (f" (and {len(missing_asins) - 5} more)"
+                 if len(missing_asins) > 5 else "")
+        logger.warning(
+            "%d of %d ASINs not found in listings report%s: %s%s. "
+            "Check that your Active Listings Report is current.",
+            len(missing_asins), len(target_asins),
+            " or Supabase" if store else "",
+            sample_str, extra,
+        )
 
     if not valid_asin_skus:
         return ValidationResult(
@@ -1013,12 +1305,12 @@ def generate_bulk_upload(
         )
 
     # Step 3: Read template headers
-    print(f"\n[4/6] Reading template headers")
+    logger.info("[4/6] Reading template headers")
     headers = read_template_headers(template_path)
-    print(f"      Using {len(headers)} columns")
+    logger.info("Using %d columns", len(headers))
 
     # Step 4: Generate campaign data
-    print(f"\n[5/6] Generating campaign data")
+    logger.info("[5/6] Generating campaign data")
     generator = BulkCampaignGenerator(config, headers)
 
     # Group SKUs by tier
@@ -1039,7 +1331,8 @@ def generate_bulk_upload(
 
     # Generate campaigns for each tier
     if tier_365_skus:
-        print(f"      Generating 365+ tier campaigns for {len(tier_365_skus)} SKUs")
+        logger.info("Generating 365+ tier campaigns for %d SKUs",
+                     len(tier_365_skus))
         generator.generate_clearance_campaigns(
             "365+", tier_365_skus,
             competitor_asins=competitor_asins,
@@ -1047,7 +1340,8 @@ def generate_bulk_upload(
         )
 
     if tier_211_skus:
-        print(f"      Generating 211-330 tier campaigns for {len(tier_211_skus)} SKUs")
+        logger.info("Generating 211-330 tier campaigns for %d SKUs",
+                     len(tier_211_skus))
         generator.generate_clearance_campaigns(
             "211-330", tier_211_skus,
             competitor_asins=competitor_asins,
@@ -1055,28 +1349,27 @@ def generate_bulk_upload(
         )
 
     rows = generator.get_rows()
-    print(f"      Generated {len(rows)} total rows")
+    logger.info("Generated %d total rows", len(rows))
 
     # Step 5: Validate and write
-    print(f"\n[6/6] Validating and writing output")
+    logger.info("[6/6] Validating and writing output")
     validation = validate_all_rows(rows)
 
     if not validation.is_valid:
-        print("\nValidation FAILED:")
+        logger.error("Validation FAILED:")
         for error in validation.errors:
-            print(f"  ERROR: {error}")
+            logger.error("  %s", error)
         return validation
 
     if validation.warnings:
-        print("\nWarnings:")
         for warning in validation.warnings:
-            print(f"  WARNING: {warning}")
+            logger.warning("  %s", warning)
 
     write_bulk_xlsx(rows, headers, output_path)
 
     # Step 6: Record run and upload file to Supabase
     if store:
-        print("\n  [Supabase] Recording generation run...")
+        logger.info("[Supabase] Recording generation run...")
         campaign_count = _count_campaigns(rows)
 
         run_id = store.record_generation_run(
@@ -1090,7 +1383,7 @@ def generate_bulk_upload(
             competitor_asins=competitor_asins,
             file_name=Path(output_path).name,
         )
-        print(f"  [Supabase] Saved as run #{run_id}")
+        logger.info("[Supabase] Saved as run #%s", run_id)
 
         try:
             storage_path = store.upload_file(output_path)
@@ -1098,13 +1391,14 @@ def generate_bulk_upload(
             store.client.table("generation_runs").update(
                 {"file_storage_path": storage_path}
             ).eq("id", run_id).execute()
-            print(f"  [Supabase] File uploaded to storage: {storage_path}")
+            logger.info("[Supabase] File uploaded to storage: %s",
+                        storage_path)
         except Exception as e:
-            print(f"  [Supabase] File upload skipped: {e}")
+            logger.warning("[Supabase] File upload skipped: %s", e)
 
-    print("\n" + "=" * 60)
-    print("SUCCESS! Upload file ready.")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("SUCCESS! Upload file ready.")
+    logger.info("=" * 60)
 
     return validation
 
@@ -1112,6 +1406,11 @@ def generate_bulk_upload(
 # =============================================================================
 # CLI
 # =============================================================================
+
+def _validate_asin_format(asin: str) -> bool:
+    """Check that an ASIN looks valid (10 alphanumeric characters)."""
+    return bool(re.match(r'^[A-Z0-9]{10}$', asin))
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1190,7 +1489,26 @@ def main():
         help="Disable Supabase integration even if credentials are configured"
     )
 
+    parser.add_argument(
+        "--delimiter",
+        help="Explicit delimiter for the Active Listings Report "
+             "(e.g., '\\t' for tab, ',' for comma). Auto-detected if omitted."
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose (DEBUG-level) logging output"
+    )
+
     args = parser.parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(levelname)s: %(message)s",
+    )
 
     # Parse ASINs
     if Path(args.asins).exists():
@@ -1199,16 +1517,27 @@ def main():
     else:
         target_asins = [a.strip() for a in args.asins.split(',') if a.strip()]
 
+    # Validate ASIN format early
+    invalid_format = [a for a in target_asins if not _validate_asin_format(a)]
+    if invalid_format:
+        sample = invalid_format[:5]
+        logger.warning(
+            "%d ASIN(s) have unexpected format (expected 10 alphanumeric "
+            "chars): %s. They will still be looked up, but may not match.",
+            len(invalid_format), ", ".join(sample),
+        )
+
     # Parse competitor ASINs
     competitor_asins = None
     if args.competitor_asins:
-        competitor_asins = [a.strip() for a in args.competitor_asins.split(',') if a.strip()]
+        competitor_asins = [a.strip() for a in args.competitor_asins.split(',')
+                           if a.strip()]
 
     # Build config
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config_dict = json.load(f)
-        config = CampaignConfig(**config_dict)
+        config = CampaignConfig.from_dict(config_dict)
     else:
         config = CampaignConfig(
             daily_budget_365_plus=args.daily_budget_365,
@@ -1216,6 +1545,11 @@ def main():
             default_bid=args.default_bid,
             bidding_strategy=args.bidding_strategy,
         )
+
+    # Parse delimiter (handle escape sequences like \t)
+    delimiter = None
+    if args.delimiter:
+        delimiter = args.delimiter.encode().decode('unicode_escape')
 
     # Parse tier assignment
     tier_assignment = None
@@ -1238,6 +1572,7 @@ def main():
         config=config,
         tier_assignment=tier_assignment,
         store=store,
+        delimiter=delimiter,
     )
 
     if not result.is_valid:
